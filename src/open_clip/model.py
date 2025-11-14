@@ -322,27 +322,122 @@ class CLIP(nn.Module):
             for n in self.visual.no_weight_decay():
                 no_wd.add('visual.' + n)
         return no_wd
+#
+    # def encode_image(self, image, normalize: bool = False):
+    #     features = self.visual(image)
+    #     return F.normalize(features, dim=-1) if normalize else features
+    def encode_image(self, image, normalize: bool = False, mask_ratio: float = 0.0):
+        """
+        编码图像特征
+        
+        Args:
+            image: [B, C, H, W] 输入图像
+            normalize: 是否 L2 归一化
+            mask_ratio: patch masking 比例 (0.0-1.0)
+        
+        Returns:
+            如果 mask_ratio > 0: (features, mask)
+            如果 mask_ratio = 0: features
+        """
+        result = self.visual(image, mask_ratio=mask_ratio)
+        
+        # 处理返回值
+        if mask_ratio > 0:
+            # visual 返回 (features, mask) 或 (features, tokens, mask)
+            if isinstance(result, tuple):
+                if len(result) == 3:  # (features, tokens, mask)
+                    features, tokens, mask = result
+                elif len(result) == 2:  # (features, mask)
+                    features, mask = result
+                else:
+                    features = result
+                    mask = None
+            else:
+                features = result
+                mask = None
+            
+            features = F.normalize(features, dim=-1) if normalize else features
+            return features, mask
+        else:
+            # 不使用 masking，向后兼容
+            if isinstance(result, tuple):
+                features = result[0]
+            else:
+                features = result
+            return F.normalize(features, dim=-1) if normalize else features
+#
+    # def encode_text(self, text, normalize: bool = False):
+    #     cast_dtype = self.transformer.get_cast_dtype()
 
-    def encode_image(self, image, normalize: bool = False):
-        features = self.visual(image)
-        return F.normalize(features, dim=-1) if normalize else features
+    #     x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
 
-    def encode_text(self, text, normalize: bool = False):
+    #     x = x + self.positional_embedding.to(cast_dtype)
+    #     x = self.transformer(x, attn_mask=self.attn_mask)
+    #     x = self.ln_final(x)  # [batch_size, n_ctx, transformer.width]
+    #     x = text_global_pool(x, text, self.text_pool_type, eos_token_id=getattr(self, "text_eos_id", None))
+    #     if self.text_projection is not None:
+    #         if isinstance(self.text_projection, nn.Linear):
+    #             x = self.text_projection(x)
+    #         else:
+    #             x = x @ self.text_projection
+
+    #     return F.normalize(x, dim=-1) if normalize else x
+    def encode_text(self, text, normalize: bool = False, mask_ratio: float = 0.0):
+        """
+        编码文本特征
+        
+        Args:
+            text: [B, L] tokenized text
+            normalize: 是否 L2 归一化
+            mask_ratio: token masking 比例 (0.0-1.0)
+        
+        Returns:
+            如果 mask_ratio > 0: (features, mask)
+            如果 mask_ratio = 0: features
+        """
         cast_dtype = self.transformer.get_cast_dtype()
+        
+        # ========== 添加文本 Masking ==========
+        text_mask = None
+        if mask_ratio > 0:
+            B, L = text.shape
+            text = text.clone()  # 避免修改原始输入
+            text_mask = torch.zeros_like(text, dtype=torch.float)
+            
+            # 获取 pad_id（如果没有定义，使用 0）
+            pad_id = getattr(self, 'pad_id', 0)
+            
+            for i in range(B):
+                # 找到有效 tokens (非 padding)
+                valid_pos = (text[i] != pad_id).nonzero(as_tuple=True)[0]
+                if len(valid_pos) > 2:  # 至少保留开始和结束 token
+                    # 不 mask 第一个和最后一个
+                    maskable = valid_pos[1:-1]
+                    num_mask = int(len(maskable) * mask_ratio)
+                    if num_mask > 0:
+                        mask_indices = maskable[torch.randperm(len(maskable), device=text.device)[:num_mask]]
+                        text_mask[i, mask_indices] = 1
+                        text[i, mask_indices] = pad_id  # 用 pad_id 替换
+        # ======================================
 
-        x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
-
+        x = self.token_embedding(text).to(cast_dtype)
         x = x + self.positional_embedding.to(cast_dtype)
         x = self.transformer(x, attn_mask=self.attn_mask)
-        x = self.ln_final(x)  # [batch_size, n_ctx, transformer.width]
+        x = self.ln_final(x)
         x = text_global_pool(x, text, self.text_pool_type, eos_token_id=getattr(self, "text_eos_id", None))
+        
         if self.text_projection is not None:
             if isinstance(self.text_projection, nn.Linear):
                 x = self.text_projection(x)
             else:
                 x = x @ self.text_projection
 
-        return F.normalize(x, dim=-1) if normalize else x
+        x = F.normalize(x, dim=-1) if normalize else x
+        
+        # 返回结果
+        if mask_ratio > 0:
+            return x, text_mask
+        return x
 
     def get_logits(self, image, text):
         image_features = self.encode_image(image, normalize=True)
@@ -455,14 +550,67 @@ class CLIP(nn.Module):
                 output['logit_bias'] = self.logit_bias
 
         return output
+#
+    # def forward(
+    #         self,
+    #         image: Optional[torch.Tensor] = None,
+    #         text: Optional[torch.Tensor] = None,
+    # ):
+    #     image_features = self.encode_image(image, normalize=True) if image is not None else None
+    #     text_features = self.encode_text(text, normalize=True) if text is not None else None
 
+    #     if self.output_dict:
+    #         out_dict = {
+    #             "image_features": image_features,
+    #             "text_features": text_features,
+    #             "logit_scale": self.logit_scale.exp()
+    #         }
+    #         if self.logit_bias is not None:
+    #             out_dict['logit_bias'] = self.logit_bias
+    #         return out_dict
+
+    #     if self.logit_bias is not None:
+    #         return image_features, text_features, self.logit_scale.exp(), self.logit_bias
+    #     return image_features, text_features, self.logit_scale.exp()
     def forward(
             self,
             image: Optional[torch.Tensor] = None,
             text: Optional[torch.Tensor] = None,
+            image_mask_ratio: float = 0.0,
+            text_mask_ratio: float = 0.0,
     ):
-        image_features = self.encode_image(image, normalize=True) if image is not None else None
-        text_features = self.encode_text(text, normalize=True) if text is not None else None
+        """
+        前向传播
+        
+        Args:
+            image: 图像输入
+            text: 文本输入
+            image_mask_ratio: 图像 masking 比例
+            text_mask_ratio: 文本 masking 比例
+        """
+        # 编码图像
+        if image is not None:
+            image_result = self.encode_image(image, normalize=True, mask_ratio=image_mask_ratio)
+            if image_mask_ratio > 0 and isinstance(image_result, tuple):
+                image_features, image_mask = image_result
+            else:
+                image_features = image_result
+                image_mask = None
+        else:
+            image_features = None
+            image_mask = None
+        
+        # 编码文本
+        if text is not None:
+            text_result = self.encode_text(text, normalize=True, mask_ratio=text_mask_ratio)
+            if text_mask_ratio > 0 and isinstance(text_result, tuple):
+                text_features, text_mask = text_result
+            else:
+                text_features = text_result
+                text_mask = None
+        else:
+            text_features = None
+            text_mask = None
 
         if self.output_dict:
             out_dict = {
@@ -470,10 +618,15 @@ class CLIP(nn.Module):
                 "text_features": text_features,
                 "logit_scale": self.logit_scale.exp()
             }
+            if image_mask is not None:
+                out_dict['image_mask'] = image_mask
+            if text_mask is not None:
+                out_dict['text_mask'] = text_mask
             if self.logit_bias is not None:
                 out_dict['logit_bias'] = self.logit_bias
             return out_dict
 
+        # 保持向后兼容
         if self.logit_bias is not None:
             return image_features, text_features, self.logit_scale.exp(), self.logit_bias
         return image_features, text_features, self.logit_scale.exp()

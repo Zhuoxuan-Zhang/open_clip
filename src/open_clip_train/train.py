@@ -98,13 +98,27 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
         if args.accum_freq == 1:
             with autocast():
-                model_out = model(images, texts)
+                model_out = model(
+                    images,
+                    texts,
+                    image_mask_ratio=args.image_mask_ratio,
+                    text_mask_ratio=args.text_mask_ratio,
+                )
+
                 logit_scale = model_out["logit_scale"]
                 if args.distill:
                     with torch.no_grad():
                         dist_model_out = dist_model(images, texts)
                     model_out.update({f'dist_{k}': v for k, v in dist_model_out.items()})
-                losses = loss(**model_out, output_dict=True)
+
+                # ====== 过滤掉 loss 不需要的字段 ======
+                model_out_filtered = {
+                    k: v for k, v in model_out.items()
+                    if k in ["image_features", "text_features", "logit_scale", "logit_bias"]
+                }
+                # ======================================
+                # losses = loss(**model_out, output_dict=True)
+                losses = loss(**model_out_filtered, output_dict=True)
 
                 total_loss = sum(losses.values())
                 losses["loss"] = total_loss
@@ -114,8 +128,12 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
             # First, cache the features without any gradient tracking.
             with torch.no_grad():
                 with autocast():
-                    model_out = model(images, texts)
-
+                    model_out = model(
+                        images,
+                        texts,
+                        image_mask_ratio=args.image_mask_ratio,
+                        text_mask_ratio=args.text_mask_ratio,
+                    )
                     for f in ("logit_scale", "logit_bias"):
                         model_out.pop(f, None)
 
@@ -141,8 +159,12 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 images = accum_images[j]
                 texts = accum_texts[j]
                 with autocast():
-                    model_out = model(images, texts)
-
+                    model_out = model(
+                        images,
+                        texts,
+                        image_mask_ratio=args.image_mask_ratio,
+                        text_mask_ratio=args.text_mask_ratio,
+                    )
                     inputs_no_accum = {}
                     inputs_no_accum["logit_scale"] = logit_scale = model_out.pop("logit_scale")
                     if "logit_bias" in model_out:
@@ -278,7 +300,12 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
                 texts = texts.to(device=device, non_blocking=True)
 
                 with autocast():
-                    model_out = model(images, texts)
+                    model_out = model(
+                        images,
+                        texts,
+                        image_mask_ratio=args.image_mask_ratio,
+                        text_mask_ratio=args.text_mask_ratio,
+                    )
                     image_features = model_out["image_features"]
                     text_features = model_out["text_features"]
                     logit_scale = model_out["logit_scale"]
@@ -382,3 +409,4 @@ def maybe_compute_generative_loss(model_out):
         token_logits = model_out["logits"]
         token_labels = model_out["labels"]
         return F.cross_entropy(token_logits.permute(0, 2, 1), token_labels)
+

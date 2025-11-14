@@ -904,8 +904,70 @@ class VisionTransformer(nn.Module):
             self.proj = None
         return take_indices
 
-    def forward(self, x: torch.Tensor):
+    # def forward(self, x: torch.Tensor):
+    #     x = self._embeds(x)
+    #     x = self.transformer(x)
+    #     pooled, tokens = self._pool(x)
+
+    #     if self.proj is not None:
+    #         pooled = pooled @ self.proj
+
+    #     if self.output_tokens:
+    #         return pooled, tokens
+        
+    #     return pooled
+    def forward(self, x: torch.Tensor, mask_ratio: float = 0.0):
+        """
+        Args:
+            x: [B, C, H, W] 输入图像
+            mask_ratio: 要 mask 的 patch 比例 (0.0-1.0)
+        
+        Returns:
+            如果 mask_ratio > 0: (pooled, tokens, mask)
+            如果 mask_ratio = 0: pooled 或 (pooled, tokens)
+        """
+        # print(f"[DEBUG] Enter VisionTransformer.forward, mask_ratio={mask_ratio}")
         x = self._embeds(x)
+        
+        # ========== 添加 Masking 逻辑 ==========
+        mask = None
+        if mask_ratio > 0:
+            B, N, D = x.shape
+            # 分离 class token 和 patch tokens
+            cls_token = x[:, :1, :]  # [B, 1, D]
+            patch_tokens = x[:, 1:, :]  # [B, N-1, D]
+            
+            # 随机 masking
+            num_patches = N - 1
+            len_keep = int(num_patches * (1 - mask_ratio))
+            
+            # 生成随机噪声并排序
+            noise = torch.rand(B, num_patches, device=x.device)
+            ids_shuffle = torch.argsort(noise, dim=1)
+            ids_keep = ids_shuffle[:, :len_keep]
+            
+            # 保留部分 patches
+            patch_tokens = torch.gather(
+                patch_tokens, dim=1, 
+                index=ids_keep.unsqueeze(-1).expand(-1, -1, D)
+            )
+            
+            # 重新拼接 class token
+            x = torch.cat([cls_token, patch_tokens], dim=1)
+            
+            # 生成 mask (0=保留, 1=masked)
+            mask = torch.ones([B, num_patches], device=x.device)
+            mask[:, :len_keep] = 0
+            ids_restore = torch.argsort(ids_shuffle, dim=1)
+            mask = torch.gather(mask, dim=1, index=ids_restore)
+
+            # ✅ Debug 打印（只打印一次）
+            if not hasattr(self, "_mask_logged"):
+                print(f"[DEBUG] Mask applied with ratio={mask_ratio}, "
+                    f"masked {mask.sum().item()} / {mask.numel()} patches")
+                self._mask_logged = True  
+        # ========================================
+        
         x = self.transformer(x)
         pooled, tokens = self._pool(x)
 
@@ -913,8 +975,12 @@ class VisionTransformer(nn.Module):
             pooled = pooled @ self.proj
 
         if self.output_tokens:
+            if mask_ratio > 0:
+                return pooled, tokens, mask
             return pooled, tokens
         
+        if mask_ratio > 0:
+            return pooled, mask
         return pooled
 
 
@@ -1218,7 +1284,33 @@ class TextTransformer(nn.Module):
         if prune_head:
             self.text_projection = None
         return take_indices
+#
+    # def forward(self, text):
+    #     x, attn_mask = self._embeds(text)
 
+    #     x = self.transformer(x, attn_mask=attn_mask)
+
+    #     # x.shape = [batch_size, n_ctx, transformer.width]
+    #     if self.cls_emb is not None:
+    #         # presence of appended cls embed (CoCa) overrides pool_type, always take last token
+    #         pooled = text_global_pool(x, pool_type='last')
+    #         pooled = self.ln_final(pooled)  # final LN applied after pooling in this case
+    #         tokens = x[:, :-1]
+    #     else:
+    #         x = self.ln_final(x)
+    #         pooled = text_global_pool(x, text, pool_type=self.pool_type, eos_token_id=getattr(self, "eos_id", None))
+    #         tokens = x
+
+    #     if self.text_projection is not None:
+    #         if isinstance(self.text_projection, nn.Linear):
+    #             pooled = self.text_projection(pooled)
+    #         else:
+    #             pooled = pooled @ self.text_projection
+
+    #     if self.output_tokens:
+    #         return pooled, tokens
+
+    #     return pooled
     def forward(self, text):
         x, attn_mask = self._embeds(text)
 
